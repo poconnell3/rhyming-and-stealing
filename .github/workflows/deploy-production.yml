@@ -1,0 +1,292 @@
+name: Deploy Rhyming and Stealing Production
+
+on:
+  push:
+    branches:
+      - main
+
+  # Allows you to run the deployment manually from GitHub.
+  workflow_dispatch:
+
+# Prevent two production deployments from running simultaneously.
+concurrency:
+  group: rhyming-and-stealing-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+      url: https://rhymingandstealing.com
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install exact dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Test
+        run: npm run test --if-present
+        env:
+          CI: "true"
+
+      - name: Build production application
+        run: npm run build
+
+      - name: Package production build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -d dist ]]; then
+            BUILD_DIR="dist"
+          elif [[ -d build ]]; then
+            BUILD_DIR="build"
+          else
+            echo "Neither dist/ nor build/ was produced."
+            exit 1
+          fi
+
+          test -f "$BUILD_DIR/index.html"
+
+          # Makes it easy to see which Git commit is deployed.
+          printf '{"commit":"%s","builtAt":"%s"}\n' \
+            "$GITHUB_SHA" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > "$BUILD_DIR/version.json"
+
+          tar -C "$BUILD_DIR" -czf release.tar.gz .
+
+      - name: Configure and validate SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY_B64: ${{ secrets.NC_SSH_KEY_B64 }}
+          KNOWN_HOSTS: ${{ secrets.NC_KNOWN_HOSTS }}
+          NC_HOST: ${{ secrets.NC_HOST }}
+          NC_PORT: ${{ secrets.NC_PORT }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${SSH_PRIVATE_KEY_B64:-}" ]]; then
+            echo "::error::NC_SSH_KEY_B64 is empty or unavailable."
+            exit 1
+          fi
+
+          if [[ -z "${KNOWN_HOSTS:-}" ]]; then
+            echo "::error::NC_KNOWN_HOSTS is empty or unavailable."
+            exit 1
+          fi
+
+          install -m 700 -d "$HOME/.ssh"
+
+          # Reconstruct the exact private-key bytes.
+          printf '%s' "$SSH_PRIVATE_KEY_B64" \
+            | base64 --decode \
+            > "$HOME/.ssh/namecheap_deploy"
+
+          chmod 600 "$HOME/.ssh/namecheap_deploy"
+
+          # Write known_hosts, normalising every key entry to the
+          # "[host]:port keytype key" bracket form that SSH requires when the
+          # target port is non-standard.  Both plain "host keytype key" lines
+          # and already-bracketed "[host]:port keytype key" lines are rewritten
+          # to "[NC_HOST]:NC_PORT keytype key" so the entry always matches
+          # exactly what SSH looks up.  Hashed (|1|…), comment, and blank lines
+          # are passed through unchanged.  Windows CRs are stripped so the file
+          # is always valid regardless of how the secret was created.
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+              ''|'#'*|'|'*) printf '%s\n' "$line" ;;
+              *)
+                rest="${line#* }"
+                printf '[%s]:%s %s\n' "$NC_HOST" "$NC_PORT" "$rest"
+                ;;
+            esac
+          done < <(printf '%s\n' "$KNOWN_HOSTS" | tr -d '\r') \
+            > "$HOME/.ssh/known_hosts"
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          # Validate that OpenSSH can actually parse the private key.
+          ssh-keygen \
+            -y \
+            -f "$HOME/.ssh/namecheap_deploy" \
+            > "$HOME/.ssh/namecheap_deploy.pub"
+
+          echo "Decoded deployment-key fingerprint:"
+
+          ssh-keygen \
+            -lf "$HOME/.ssh/namecheap_deploy.pub"
+
+          # Validate the exact Namecheap host and port entry.
+          if ! ssh-keygen \
+            -F "[$NC_HOST]:$NC_PORT" \
+            -f "$HOME/.ssh/known_hosts" \
+            > /dev/null; then
+
+            echo "::error::No known_hosts entry exists for [$NC_HOST]:$NC_PORT."
+            exit 1
+          fi
+
+          echo "Private key parsed successfully."
+          echo "Host-key entry found for [$NC_HOST]:$NC_PORT."
+
+      - name: Upload release to Namecheap
+        shell: bash
+        env:
+          NC_HOST: ${{ secrets.NC_HOST }}
+          NC_PORT: ${{ secrets.NC_PORT }}
+          NC_USER: ${{ secrets.NC_USER }}
+        run: |
+          set -Eeuo pipefail
+
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+
+          ssh \
+            -i "$HOME/.ssh/namecheap_deploy" \
+            -p "$NC_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o PreferredAuthentications=publickey \
+            -o PasswordAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "$NC_USER@$NC_HOST" \
+            'mkdir -p "$HOME/deployments" "$HOME/releases/rhyming-and-stealing" "$HOME/backups/rhyming-and-stealing"'
+
+          scp \
+            -i "$HOME/.ssh/namecheap_deploy" \
+            -P "$NC_PORT" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o PreferredAuthentications=publickey \
+            -o PasswordAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            release.tar.gz \
+            "$NC_USER@$NC_HOST:deployments/rhyming-and-stealing-${SHORT_SHA}.tar.gz"
+
+      - name: Activate release
+        shell: bash
+        env:
+          NC_HOST: ${{ secrets.NC_HOST }}
+          NC_PORT: ${{ secrets.NC_PORT }}
+          NC_USER: ${{ secrets.NC_USER }}
+          NC_DEPLOY_PATH: ${{ secrets.NC_DEPLOY_PATH }}
+        run: |
+          set -Eeuo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::12}"
+
+          ssh \
+            -i "$HOME/.ssh/namecheap_deploy" \
+            -p "$NC_PORT" \
+            -o BatchMode=yes \
+            "$NC_USER@$NC_HOST" \
+            "DEPLOY_PATH='$NC_DEPLOY_PATH' SHORT_SHA='$SHORT_SHA' bash -s" <<'REMOTE'
+          set -Eeuo pipefail
+          umask 022
+
+          RELEASE_DIR="$HOME/releases/rhyming-and-stealing/$SHORT_SHA"
+          ARCHIVE="$HOME/deployments/rhyming-and-stealing-$SHORT_SHA.tar.gz"
+          BACKUP_DIR="$HOME/backups/rhyming-and-stealing"
+          TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+          mkdir -p \
+            "$RELEASE_DIR" \
+            "$DEPLOY_PATH" \
+            "$BACKUP_DIR"
+
+          tar -xzf "$ARCHIVE" -C "$RELEASE_DIR"
+
+          # Never activate a release without a valid entry page.
+          test -f "$RELEASE_DIR/index.html"
+
+          # Back up current production, preserving SSL challenge files.
+          if find "$DEPLOY_PATH" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              ! -name '.well-known' \
+              -print -quit \
+              | grep -q .; then
+
+            tar \
+              --exclude='./.well-known' \
+              -czf "$BACKUP_DIR/$TIMESTAMP-$SHORT_SHA.tar.gz" \
+              -C "$DEPLOY_PATH" \
+              .
+          fi
+
+          # Remove old application files but preserve .well-known.
+          find "$DEPLOY_PATH" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name '.well-known' \
+            -exec rm -rf {} +
+
+          # Copy the new build into production.
+          cp -a "$RELEASE_DIR"/. "$DEPLOY_PATH"/
+
+          chmod -R u=rwX,go=rX "$DEPLOY_PATH"
+
+          rm -f "$ARCHIVE"
+
+          # Retain backups and extracted releases for 30 days.
+          find "$BACKUP_DIR" \
+            -type f \
+            -name '*.tar.gz' \
+            -mtime +30 \
+            -delete
+
+          find "$HOME/releases/rhyming-and-stealing" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -mtime +30 \
+            -exec rm -rf {} +
+          REMOTE
+
+      - name: Verify production
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          for attempt in 1 2 3 4 5; do
+            STATUS="$(
+              curl \
+                --silent \
+                --show-error \
+                --location \
+                --output /dev/null \
+                --write-out '%{http_code}' \
+                https://rhymingandstealing.com/ \
+                || true
+            )"
+
+            if [[ "$STATUS" == "200" ]]; then
+              echo "Production returned HTTP 200."
+              exit 0
+            fi
+
+            echo "Attempt $attempt returned HTTP $STATUS."
+            sleep 5
+          done
+
+          echo "Production health check failed."
+          exit 1
