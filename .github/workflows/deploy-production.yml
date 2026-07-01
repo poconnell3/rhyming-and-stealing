@@ -77,16 +77,14 @@ jobs:
         shell: bash
         env:
           SSH_PRIVATE_KEY_B64: ${{ secrets.NC_SSH_KEY_B64 }}
+          SSH_PRIVATE_KEY: ${{ secrets.NC_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.NC_KNOWN_HOSTS }}
           NC_HOST: ${{ secrets.NC_HOST }}
           NC_PORT: ${{ secrets.NC_PORT }}
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "${SSH_PRIVATE_KEY_B64:-}" ]]; then
-            echo "::error::NC_SSH_KEY_B64 is empty or unavailable."
-            exit 1
-          fi
+          KEY_PATH="$HOME/.ssh/namecheap_deploy"
 
           if [[ -z "${KNOWN_HOSTS:-}" ]]; then
             echo "::error::NC_KNOWN_HOSTS is empty or unavailable."
@@ -95,12 +93,48 @@ jobs:
 
           install -m 700 -d "$HOME/.ssh"
 
-          # Reconstruct the exact private-key bytes.
-          printf '%s' "$SSH_PRIVATE_KEY_B64" \
-            | base64 --decode \
-            > "$HOME/.ssh/namecheap_deploy"
+          write_deploy_key() {
+            local secret_value="$1"
 
-          chmod 600 "$HOME/.ssh/namecheap_deploy"
+            if [[ -z "$secret_value" ]]; then
+              return 1
+            fi
+
+            # Raw PEM pasted into the secret (with or without trailing newline).
+            if [[ "$secret_value" == -----BEGIN\ * ]]; then
+              printf '%s\n' "$secret_value" | tr -d '\r' > "$KEY_PATH"
+              return 0
+            fi
+
+            # Base64-encoded PEM. Strip wrapping whitespace before decoding.
+            if ! printf '%s' "$secret_value" \
+              | tr -d '[:space:]' \
+              | base64 --decode > "$KEY_PATH" 2>/dev/null; then
+              echo "::error::Failed to base64-decode NC_SSH_KEY_B64."
+              return 1
+            fi
+
+            if ! grep -q '^-----BEGIN ' "$KEY_PATH"; then
+              echo "::error::NC_SSH_KEY_B64 did not decode to an OpenSSH private key."
+              echo "Recreate the secret from your deploy key with:"
+              echo "  base64 < ~/.ssh/namecheap_deploy | tr -d '\\n'"
+              return 1
+            fi
+
+            return 0
+          }
+
+          if write_deploy_key "${SSH_PRIVATE_KEY_B64:-}"; then
+            echo "Loaded deployment key from NC_SSH_KEY_B64."
+          elif write_deploy_key "${SSH_PRIVATE_KEY:-}"; then
+            echo "Loaded deployment key from NC_SSH_KEY."
+          else
+            echo "::error::No usable SSH private key secret is configured."
+            echo "Set NC_SSH_KEY_B64 (preferred) or NC_SSH_KEY in the production environment."
+            exit 1
+          fi
+
+          chmod 600 "$KEY_PATH"
 
           # Write known_hosts, normalising every key entry to the
           # "[host]:port keytype key" bracket form that SSH requires when the
@@ -124,10 +158,17 @@ jobs:
           chmod 600 "$HOME/.ssh/known_hosts"
 
           # Validate that OpenSSH can actually parse the private key.
-          ssh-keygen \
+          if ! ssh-keygen \
             -y \
-            -f "$HOME/.ssh/namecheap_deploy" \
-            > "$HOME/.ssh/namecheap_deploy.pub"
+            -f "$KEY_PATH" \
+            > "$HOME/.ssh/namecheap_deploy.pub" 2>"$HOME/.ssh/keygen.err"; then
+            echo "::error::OpenSSH could not parse the deployment private key."
+            sed 's/^/  /' "$HOME/.ssh/keygen.err" >&2
+            echo "If you see 'error in libcrypto', NC_SSH_KEY_B64 is usually wrong."
+            echo "Recreate it from the working deploy key with:"
+            echo "  base64 < ~/.ssh/namecheap_deploy | tr -d '\\n'"
+            exit 1
+          fi
 
           echo "Decoded deployment-key fingerprint:"
 
